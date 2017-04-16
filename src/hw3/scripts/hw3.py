@@ -23,6 +23,9 @@ import trajectory_msgs.msg
 from visualization_msgs.msg import InteractiveMarkerControl
 from visualization_msgs.msg import Marker
 
+import datetime
+
+
 def convert_to_message(T):
     t = geometry_msgs.msg.Pose()
     position = tf.transformations.translation_from_matrix(T)
@@ -234,7 +237,7 @@ class MoveArm(object):
                 a_vec.append(a)
                 v_vec.append(v)
                 t = t+resolution
-        self.plot_series(t_vec,q_vec,"Position")
+	self.plot_series(t_vec,q_vec,"Position")
         self.plot_series(t_vec,v_vec,"Velocity")
         self.plot_series(t_vec,a_vec,"Acceleration")
         plt.show()
@@ -287,26 +290,447 @@ class MoveArm(object):
     In addition, you can use the function self.is_state_valid(q_test) to test if the joint positions 
     in a given array q_test create a valid (collision-free) state. q_test will be expected to 
     contain 7 elements, each representing a joint position, in the same order as q_start and q_goal.
-    """               
-    def motion_plan(self, q_start, q_goal, q_min, q_max):
-        # ---------------- replace this with your code ------------------
-        # This simple example creates a trajectory with just the start and goal points
-        q_list = []
+    """    
+    #-----------------------------------------------------------------------------------------
+    # --------------------------------------------------------------------------------------- 
+    # John Sy, Nate Apgar, Brian Bradley
+    # MECE E4602, Fall 2015  
+
+    # Motion Planning Strategy boolean. 
+    # Set to True to use PRM and False to use RRT
+    global usePRM
+    usePRM = True
+
+    # Computes unit directional vector
+    def getUnitDirVec(self,start,end):
+	direction = numpy.subtract(end,start)
+	unitDirVec = direction/numpy.linalg.norm(direction)
+	return unitDirVec
+
+    #
+    '''## Shortcutting'''
+    # This function creates shortcuts the path to the goal in order to achieve 
+    # the most direct route possible from the current nodes.   
+    def shortcut(self,q_list):
+        i = 0
+        while i < len(q_list)-2:
+            unit_dirVec = self.getUnitDirVec(q_list[i],q_list[i+2])
+            step = 0.1
+            valid_segment = True
+            while valid_segment and numpy.linalg.norm(numpy.subtract((q_list[i] + step*unit_dirVec),q_list[i+2])) > 0.1:
+                if self.is_state_valid(q_list[i] + step*unit_dirVec):
+                   step = step + 0.1
+                else:
+                   valid_segment = False
+            if valid_segment:
+                del q_list[i+1]
+            else:
+                i = i + 1
+        return q_list
+
+
+    #	
+    '''## Re-sampling'''
+    # This function resamples the q_list so that the segments are spaced apart as 
+    # closed together as possible while still being 0.5 units apart
+    def resample(self,q_list):
+        i = 0
+	while i < len(q_list)-1:
+	    # If the distance between two nodes is greater than 1, insert segments
+            if numpy.linalg.norm(numpy.subtract(q_list[i+1],q_list[i])) >= 1:
+                unit_dirVec = self.getUnitDirVec(q_list[i],q_list[i+1])
+                dirVec = numpy.subtract(q_list[i+1],q_list[i])
+                numSegmentInsert = int(numpy.linalg.norm(dirVec)/0.5) 
+                # Round down so that the segments are bigger than 0.5
+
+                segmentLength = numpy.linalg.norm(dirVec)/numSegmentInsert
+
+	        for j in range(numSegmentInsert-1): # number of nodes = number of segments - 1
+                    q_list.insert(i+j+1,q_list[i]+segmentLength*(j+1)*unit_dirVec)
+                i = i + numSegmentInsert
+            else: 
+                i += 1
+        return q_list
+    
+    #
+    '''## Trajectory Execution'''
+    # This function takes in q_list and outputs a_list and v_list as well as the spline 
+    # coefficients a, b, c, and d
+    def traj_compute(self,q_list):
+            N = len(q_list) # N = number of waypoints
+            v_list = numpy.empty((N, 7))
+            a_list = numpy.empty((N, 7))
+            a = numpy.empty((N-1, 7))
+            b = numpy.empty((N-1, 7))
+            c = numpy.empty((N-1, 7))
+            d = numpy.empty((N-1, 7))    
+
+            # coefficients = [a1, b1, c1, d1, a2, b2, c2, ....., an, bn, cn, dn] - for each joint
+            coefficients = numpy.zeros((4*(N-1), 7))
+    
+            for joint in range(0, 7):
+                A = numpy.zeros((4*(N-1), 4*(N-1)))
+                b = numpy.zeros((4*(N-1)))
+        
+                # qdot0 and qdotfinal = 0
+		# Sets our two constraints in order to have a fully determined system
+                A[0][2] = 1
+                A[1][4*(N-1) - 4] = 3
+                A[1][4*(N-1) - 3] = 2
+                A[1][4*(N-1) - 2] = 1
+            
+                row = 2
+        
+                # d_i = q_i
+		# Solves the d coefficient for each segment
+                for i in range(0, N-1):
+                    A[row][4*i + 3] = 1 
+                    b[row] = q_list[i][joint]
+                    row += 1
+        
+                # a_i + b_i + c_i + d_i = q_i+1
+		# Solves the velocity of the segment at the next time step
+                for i in range(0, N-1):
+                    A[row][4*i:4*i+4] = 1
+                    b[row] = q_list[i + 1][joint]
+                    row += 1
+        
+                # qdotT_i - qdot0_i+1= 0 (continuous velocity)
+		# Sets the initial velocity of a segment equal to the final velocity 
+		# of the previous segment
+                for i in range(0, N-2):
+                    A[row][4 * i] = 3
+                    A[row][4 * i + 1] = 2
+                    A[row][4 * i + 2] = 1
+                    A[row][4 * i + 6] = -1
+                    row += 1
+            
+                # qddot_i - qddot_i+1 = 0 (continuous acceleration)
+		# Sets the initial acceleration of a segment equal to the final velocity 
+		# of the previous segment
+                for i in range(0, N-2):
+                    A[row][4 * i] = 6
+                    A[row][4 * i + 1] = 2
+                    A[row][4 * i + 5] = -2
+                    row += 1 
+		    
+		# Solve for the coefficients of the current joint
+                current_coefficients = numpy.dot(numpy.linalg.inv(A), b)
+		 
+                for i in range(0, len(A)):
+                    coefficients[i][joint] = current_coefficients[i]
+            
+                #use coefficients to generate v_list and a_list
+                for i in range(0, N-1):
+                    v_list[i][joint] = coefficients[4*i + 2][joint]
+                    a_list[i][joint] = 2*coefficients[4*i + 1][joint]
+                
+                v_list[N-1][joint] = 0
+                a_list[N-1][joint] = 6*current_coefficients[0] + 2*current_coefficients[1]
+		
+	        t = numpy.empty(len(q_list))
+		for i in range(0,len(q_list)):
+	            t[i] = i
+            
+	    # Show plots
+	    if self.show_plots != False:
+	        self.plot_trajectory(len(q_list)-1,coefficients[:,1],1)
+	
+            return v_list, a_list, t, coefficients
+
+
+    # Performs Dijkstra's algorithm
+    def Dijkstra(self,startNode,roadmap,goalNode):
+        keepMoving = []
+        superRoadMap = []
+        superRoadMap.append(startNode)
+        for i in range(len(roadmap)):
+            superRoadMap.append(roadmap[i])
+        superRoadMap.append(goalNode)
+                
+        # Now superRoadMap contains all the nodes, including start and goal
+        # startNode, then a bunch of random nodes, and lastly goalNode
+        for i in range(len(superRoadMap)):
+            superRoadMap[i].parent.append([-1,False]) # The number is the g(n) and the boolean determines if it has been visited
+            keepMoving.append(False)
+        startNode.parent[-1][0] = True
+        # Now all the nodes have [-1,False] at the end of their parentList except startNode [0,False]
+        # This node info can be accessed by superRoadMap[i].parent[-1][0 or 1]
+        print keepMoving
+        while not all(keepMoving):
+	    #print "loop 0"
+            #print "Rudolph"
+            lowestPathIndex = 0
+            lowestPathLength = 10000000000000
+            for i in range(len(superRoadMap)): # Find the node with lowest path length
+                if superRoadMap[i].parent[-1][0] > 0 and superRoadMap[i].parent[-1][0] <= lowestPathLength and superRoadMap[i].parent[-1][1] == False:
+                    lowestPathIndex = i
+                    lowestPathLength = superRoadMap[i].parent[-1][0]
+            # Sometimes when lowestPathLength == 10000000000000, which means it somehow did not pick up the node with lowest g(n), it goes into infinite loop
+            print lowestPathIndex
+            print lowestPathLength
+            #print "Lowest Path Index: " + str(lowestPathIndex)
+            superRoadMap[lowestPathIndex].parent[-1][1] = True # Mark it as visited
+            for i in range(len(superRoadMap[lowestPathIndex].parent)-1): # -1 because don't want to visit the last item that contains node info
+                if superRoadMap[lowestPathIndex].parent[i].parent[-1][1] == False:
+                    d = numpy.linalg.norm(numpy.subtract(superRoadMap[lowestPathIndex].q,superRoadMap[lowestPathIndex].parent[i].q))
+                    if superRoadMap[lowestPathIndex].parent[i].parent[-1][0] == -1:
+                        superRoadMap[lowestPathIndex].parent[i].parent[-1][0] = superRoadMap[lowestPathIndex].parent[-1][0] + d
+                    else:
+                        superRoadMap[lowestPathIndex].parent[i].parent[-1][0] = min(superRoadMap[lowestPathIndex].parent[-1][0] + d, superRoadMap[lowestPathIndex].parent[i].parent[-1][0])
+            for i in range(len(superRoadMap)):
+                keepMoving[i] = superRoadMap[i].parent[-1][1]
+            print keepMoving
+        # Now all nodes in superRoadMapshould have g(n)
+        return superRoadMap
+
+
+    # Finds the shortest path from the start to the goal and the shortest distance
+    def DistanceT(self,superRoadMap):
+        rev_shortestPath = [] # This will contain the nodes of the shortest path from goal to start
+        rev_shortestPath.append(superRoadMap[-1])
+        shortestPath = [] # This will contain the coordinates of the shortest path from start to goal
+        shortestPath.append(superRoadMap[0].q)
+        shortestLength = 0
+        currentNode = superRoadMap[-1]
+        while currentNode != superRoadMap[0]:
+	    #print "loop 1"
+            smallestGD = 1000000000
+            i_smallestGD = 0
+            for i in range(len(currentNode.parent)-1):
+                GD = currentNode.parent[i].parent[-1][0] + numpy.linalg.norm(numpy.subtract(currentNode.q,currentNode.parent[i].q))
+                if GD < smallestGD:
+                    smallestGD = GD
+                    i_smallestGD = i
+            rev_shortestPath.append(currentNode.parent[i_smallestGD])
+            currentNode = currentNode.parent[i_smallestGD]
+            shortestLength = shortestLength + smallestGD
+        for i in range(len(rev_shortestPath)-1,-1,-1):
+            shortestPath.append(rev_shortestPath[i].q)
+        for i in range(len(superRoadMap)):
+            del superRoadMap[i].parent[-1] # Clean up the node info
+        return shortestPath, shortestLength
+
+
+
+    # Conduct motion planning using PRM
+    def PRM(self, q_start, q_goal, q_min, q_max):
+	q_list = []
         q_list.append(q_start)
-        q_list.append(q_goal)
-        print "Example q_list:"
-        print q_list
-        # A provided convenience function creates the velocity and acceleration data, 
-        # assuming 0 velocity and acceleration at each intermediate point, and 10 seconds
-        # for each trajectory segment.
-        v_list,a_list,t = self.compute_simple_timing(q_list, 10)
-        print "Example v_list and a_list:"
-        print v_list
-        print a_list
-        print "Example t:"
-        print t
+
+	# This will contain all nodes (not q's) to be inserted
+        nodes = [] 
+
+	# This will contain all coordinates to be inserted in reverse order
+        rev_q_list = [] 
+
+	roadmap = []
+        startNode = RRTNode()
+        startNode.q = q_start
+        startNode.parent = []
+        goalNode = RRTNode()
+        goalNode.q = q_goal
+        goalNode.parent = []
+        start_goal = []
+        start_goal.append(startNode)
+        start_goal.append(goalNode)
+        T = 60 # in seconds
+        start_time = datetime.datetime.now()
+        temp_q_list = []
+        plot_length = []
+        previous_time_stamp = datetime.datetime.now()
+
+        while (datetime.datetime.now()-start_time).seconds < T:
+	    #print "loop 2"
+            valid_r = False # Set false first just to get into the loop
+            r = []
+            for i in range(len(q_min)):
+                r.append((q_max[i]-q_min[i])*numpy.random.random_sample()+q_min[i])
+            if self.is_state_valid(r):
+                newNode = RRTNode()
+                newNode.q = r
+                newNode.parent = []
+                roadmap.append(newNode)
+                # Check connection to other nodes in roadmap
+                for i in range(len(roadmap)-1): # Excluding the newest node added
+                    unitDir = self.getUnitDirVec(roadmap[i].q,newNode.q)
+                    step = 0.1
+                    valid_segment = True
+                    while valid_segment and numpy.linalg.norm(numpy.subtract((roadmap[i].q + step*unitDir),newNode.q)) > 0.1:
+			#print "Loop 3"
+                        if self.is_state_valid(roadmap[i].q + step*unitDir):
+                            step = step + 0.1
+                        else:
+                            valid_segment = False
+                    if valid_segment: # Connect the two points together
+                        roadmap[i].parent.append(newNode)
+                        newNode.parent.append(roadmap[i])
+                # Check connection to start and goal node
+                for i in range(len(start_goal)):
+                    unitDir = self.getUnitDirVec(start_goal[i].q,newNode.q)
+                    step = 0.1
+                    valid_segment = True
+                    while valid_segment and numpy.linalg.norm(numpy.subtract((start_goal[i].q + step*unitDir),newNode.q)) > 0.1:
+			#print "loop 4"
+                        if self.is_state_valid(start_goal[i].q + step*unitDir):
+                            step = step + 0.1
+                        else:
+                            valid_segment = False
+                    if valid_segment: # Connect the start/goal point with newNode
+                        start_goal[i].parent.append(newNode)
+                        newNode.parent.append(start_goal[i])
+                if len(newNode.parent) == 0:
+                    del roadmap[-1]
+                if len(startNode.parent) > 0 and len(goalNode.parent) > 0:
+                    temp_q_list, temp_distance = self.DistanceT(self.Dijkstra(startNode,roadmap,goalNode))
+                    if (datetime.datetime.now()-previous_time_stamp).seconds >= 1 and (datetime.datetime.now()-previous_time_stamp).microseconds >= 1:
+                        previous_time_stamp = datetime.datetime.now()
+                        plot_length.append(temp_distance)
+        if len(startNode.parent) == 0 or len(goalNode.parent) == 0:
+	    print "No path found after " + str(T) + " seconds"
+            return []
+
+        plot_time = range(len(plot_length))
+        self.plot_series(plot_time,plot_length,'Shortest Path by Dijkstra')
+        plt.show() # Uncomment this if you want to see the plot, but need to close it before the robot moves
+
+        q_list = temp_q_list
+
+        return q_list
+
+
+
+    # Conduct motion planning using RRT
+    def RRT(self, q_start, q_goal, q_min, q_max):
+	q_list = []
+        q_list.append(q_start)
+
+	# This will contain all nodes (not q's) to be inserted
+        nodes = [] 
+
+	# This will contain all coordinates to be inserted in reverse order
+        rev_q_list = [] 
+
+        # Find a valid random point within legal range
+        q_see_goal = False
+        while (q_see_goal == False) and len(nodes) <= 2000:
+	    # Set false first just to intialize the loop
+            valid_r = False 
+            r = []
+            for i in range(len(q_min)):
+                r.append((q_max[i]-q_min[i])*numpy.random.random_sample()+q_min[i])
+
+            # Find the point p in tree closest to r        
+            closest_node = RRTNode()
+	    # Temporarily make q_start to be the closest node
+            closest_node.q = q_start 
+            closest_node.parent = None
+            closest_node_distance = numpy.linalg.norm(numpy.subtract(closest_node.q,r))
+            for p in nodes:
+		# Compute p-r distance
+                p_r_distance = numpy.linalg.norm(numpy.subtract(p.q,r)) 
+                if p_r_distance < closest_node_distance:
+		    # now closest_node is the referring to p
+                    closest_node = p 
+                    closest_node_distance = p_r_distance
+
+            '''# Now closest_node holds the parent node for the potential new node 
+	    # (not instantiated yet)
+            # Think of each name as individual pointer; can point to the same 
+	    # var/object or be reassigned'''
+
+            # Compute the direction of growth from closest_node
+            unit_dir = self.getUnitDirVec(closest_node.q,r)
+            r_insert = closest_node.q + 0.5*unit_dir # Potential insertion point coordinates
+            
+
+            # Now instantiate the potential node
+            newNode = RRTNode()
+            newNode.q = r_insert
+            newNode.parent = closest_node
+        
+            # Check if the segment is valid before insertion 
+	    # (else skip the rest and find another point)
+	    # Only sample the path segment if the potential node is valid
+            if self.is_state_valid(newNode.q): 
+                step = 0.1
+                valid_segment = True # Just to initialize loop
+                while valid_segment and step < 0.5:
+                    if self.is_state_valid(closest_node.q + step*unit_dir):
+                        step = step + 0.1
+                    else:
+                        valid_segment = False
+		# Add new node to the tree if the segment is valid 
+		# (else skip the rest and find another point)
+                if valid_segment: 
+                    nodes.append(newNode)
+                    print "Number of nodes in tree: " + str(len(nodes))
+                    # Check if it can connect to the goal after the new node is
+		    # added (else skip the rest and find another point)
+                    unit_dir_to_goal = self.getUnitDirVec(newNode.q,q_goal)
+                    step = 0.1
+                    valid_segment = True # Redefined for checking newNode to goal
+                    while valid_segment and numpy.linalg.norm(numpy.subtract((newNode.q + step*unit_dir_to_goal),q_goal)) > 0.1:
+                        if self.is_state_valid(newNode.q + step*unit_dir_to_goal):
+                            step = step + 0.1
+                        else:
+                            valid_segment = False
+		    # valid_segment==True, then stop getting new nodes; 
+		    # else loop back again
+                    if valid_segment: 
+                        q_see_goal = True
+                        currentNode = nodes[len(nodes)-1]
+                        #print numpy.subtract(currentNode.q,q_start)
+                        #print all(numpy.subtract(currentNode.q,q_start))
+                        while all(numpy.subtract(currentNode.q,q_start)):
+                            rev_q_list.append(currentNode.q)
+                            currentNode = currentNode.parent
+        '# End of while loop for getting new nodes'           
+
+        # Quit trying if too much effort
+        if q_see_goal == False:
+	    print "Error: Goal not found."
+            return [], [], [], 0
+
+        # Push the path nodes to q_list
+        for i in range(len(rev_q_list)-1,-1,-1):
+            q_list.append(rev_q_list[i])
+        q_list.append(q_goal) 
+	'# Now q_list contains all the path nodes'
+
+        return q_list
+
+
+
+    # --------------------------------------
+    '''## Main motion planning funtion'''
+    # --------------------------------------
+    def motion_plan(self, q_start, q_goal, q_min, q_max):
+	# Choose motion planning strategy
+	if usePRM == True:
+	    q_list = self.PRM(q_start, q_goal, q_min, q_max)
+        else:
+	    q_list = self.RRT(q_start, q_goal, q_min, q_max)
+	
+	if q_list == []:
+	    return [], [] , [], 0
+
+	# Shortcut the current q_list
+	q_list = self.shortcut(q_list)
+        
+	# Resample the current q_list
+	q_list = self.resample(q_list)
+	    
+        '# q_list is finalized; end of motion planning'
+
+	# Trajectory Planning
+        v_list,a_list,t,coeffs = self.traj_compute(q_list)
+
         return q_list, v_list, a_list, t
-        # ---------------------------------------------------------------
+
+    #------------------------------------------------------------------------------
+    '''# End of our HW3 code'''
+    # -----------------------------------------------------------------------------
 
     def project_plan(self, q_start, q_goal, q_min, q_max):
         q_list, v_list, a_list, t = self.motion_plan(q_start, q_goal, q_min, q_max)
@@ -314,7 +738,7 @@ class MoveArm(object):
         return joint_trajectory
 
     def moveit_plan(self, q_start, q_goal, q_min, q_max):
-        self.group.clear_pose_targets()
+        self.group.clear_pose_tarUs()
         self.group.set_joint_value_target(q_goal)
         plan=self.group.plan()
         joint_trajectory = plan.joint_trajectory
