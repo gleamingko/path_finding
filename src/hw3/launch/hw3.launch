@@ -1,0 +1,20 @@
+<launch>
+
+  <include file="$(find robot_sim)/launch/baxter.launch"/>
+   
+  <node pkg="baxter_interface" name="joint_trajectory_action_server" 
+	type="joint_trajectory_action_server.py" output="screen"/>
+
+  <include file="$(find baxter_moveit_config)/launch/planning_context.launch">
+    <arg name="load_robot_description" value="true"/>
+  </include>
+
+  <include file="$(find baxter_moveit_config)/launch/move_group.launch">
+    <arg name="kinect" value="false" />
+    <arg name="allow_trajectory_execution" value="true"/>
+  </include>
+
+  <node name="$(anon rviz)" pkg="rviz" type="rviz" respawn="false"
+	args="-d $(find hw3)/config/hw3.rviz" output="screen"/>
+
+</launch>
